@@ -1,0 +1,65 @@
+{
+  "name": "mrtree",
+  "version": "0.0.0",
+  "description": "A small CLI utility for managine git worktrees",
+  "type": "module",
+  "bin": "dist/__bin__/mrtree.js",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=26.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p ./tsconfig.build.json",
+    "test": "ava",
+    "lint": "eslint ./{src,tests}/**/*.{ts,js} && publint"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Comandeer/mrtree.git"
+  },
+  "keywords": [
+    "git worktrees"
+  ],
+  "author": "Comandeer",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Comandeer/mrtree/issues"
+  },
+  "homepage": "https://github.com/Comandeer/mrtree#readme",
+  "commitplease": {
+    "nohook": true,
+    "style": "angular",
+    "types": [
+      "feat",
+      "fix",
+      "docs",
+      "style",
+      "refactor",
+      "perf",
+      "test",
+      "build",
+      "ci",
+      "chore",
+      "revert"
+    ],
+    "scope": "\\S+.*"
+  },
+  "config": {
+    "commitizen": {
+      "path": "./node_modules/cz-conventional-changelog"
+    }
+  },
+  "devDependencies": {
+    "@comandeer/eslint-config": "0.18.0",
+    "@typescript/native": "npm:typescript@7.0.2",
+    "ava": "8.0.1",
+    "commitplease": "3.2.0",
+    "cz-conventional-changelog": "3.3.0",
+    "eslint": "10.8.1",
+    "husky": "9.1.7",
+    "publint": "0.3.24",
+    "typescript": "npm:@typescript/typescript6@6.0.2"
+  }
+}

@@ -1,7 +1,7 @@
 {
-  "name": "mrtree",
+  "name": "@comandeer/mrtree",
   "version": "0.0.0",
-  "description": "A small CLI utility for managine git worktrees",
+  "description": "A small CLI utility for managing git worktrees",
   "type": "module",
   "bin": "dist/__bin__/mrtree.js",
   "files": [

@@ -13,7 +13,8 @@
   "scripts": {
     "build": "tsc -p ./tsconfig.build.json && chmod +x ./dist/__bin__/mrtree.js",
     "test": "ava",
-    "lint": "eslint && publint"
+    "lint": "eslint",
+    "preversion": "npm run build && publint"
   },
   "repository": {
     "type": "git",

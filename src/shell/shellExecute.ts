@@ -1,17 +1,17 @@
 import { execSync, type ExecSyncOptionsWithBufferEncoding, type SpawnSyncReturns } from 'node:child_process';
 import type { ShellExecutorOptions, ShellResult } from './ShellExecutor.ts';
 
-export function shellExecute( options: ShellExecutorOptions ): Promise<ShellResult> {
+export async function shellExecute( options: ShellExecutorOptions ): Promise<ShellResult> {
 	try {
 		const command = prepareCommand( options );
 		const execOptions = prepareOptions( options );
 		const result = execSync( command, execOptions );
 		const resultAsString = result.toString( 'utf-8' );
 
-		return Promise.resolve( {
+		return {
 			ok: true,
 			result: resultAsString
-		} );
+		};
 	} catch ( error ) {
 		if ( !isSpawnResult( error ) ) {
 			throw error;
@@ -19,10 +19,10 @@ export function shellExecute( options: ShellExecutorOptions ): Promise<ShellResu
 
 		const errorAsString = error.stderr.toString( 'utf-8' );
 
-		return Promise.resolve( {
+		return {
 			ok: false,
 			error: errorAsString
-		} );
+		};
 	}
 }
 

@@ -6,6 +6,8 @@
 	"compilerOptions": {
 		"outDir": "dist/",
 
+		"types": [ "node" ],
+
 		"module": "nodenext",
 		"moduleResolution": "nodenext",
 		"resolveJsonModule": true,
@@ -17,6 +19,7 @@
 		"verbatimModuleSyntax": true,
 		"allowImportingTsExtensions": true,
 		"rewriteRelativeImportExtensions": true,
+		"erasableSyntaxOnly": true,
 
 		"strict": true,
 		"strictNullChecks": true,

@@ -13,7 +13,9 @@ export default defineConfig( [
 			// listWorkTrees: () => Promise<Array<string>>;
 			'@stylistic/type-annotation-spacing': 'off',
 			// Apparently it's broken for some reason…
-			'@typescript-eslint/no-unnecessary-condition': 'off'
+			'@typescript-eslint/no-unnecessary-condition': 'off',
+			// See https://github.com/Comandeer/eslint-config/issues/122
+			'@stylistic/dot-location': [ 'error', 'property' ]
 		}
 	}
 ] );

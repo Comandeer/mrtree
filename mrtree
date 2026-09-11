@@ -1,0 +1,444 @@
+#!/usr/bin/env node
+
+import { spawnSync } from 'node:child_process';
+import { cpSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
+import process from 'node:process';
+import { parseArgs } from 'node:util';
+
+// `feature`, `hotfix` and `spike` are the prefixes required by the PR templates;
+// `epic` is used for the long lived branches that collect several PRs.
+const BRANCH_PREFIXES = [ 'feature', 'hotfix', 'spike', 'epic' ];
+const DEFAULT_PREFIX = 'feature';
+const DEFAULT_BASE = 'main';
+const TICKET_PREFIX = 'TINYMCE-';
+
+// Gitignored machine-local settings, so they never come with a fresh checkout.
+const LOCAL_CONFIG = [ '.env', '.licensekeys', 'CLAUDE.local.md', '.claude/settings.local.json' ];
+
+const HELP = `mrtree — manage git worktrees for the tinymce-premium monorepo
+
+Usage:
+  ./mrtree add <issue> [--type <prefix>] [--base <branch>] [--no-editor]
+  ./mrtree remove <issue> [--type <prefix>] [--force]
+  ./mrtree list [<issue>]
+
+Commands:
+  add      Create <prefix>/${TICKET_PREFIX}<issue> in a new worktree, copy the local
+           config files, install dependencies, run the initial build and open
+           the editor. A branch of that name that already exists locally or on
+           origin is checked out instead of being started again. An existing
+           worktree is reported as an error and just opened in the editor.
+  remove   Remove the worktree for <prefix>/${TICKET_PREFIX}<issue> and delete its branch.
+  list     List the worktrees of this repository, optionally filtered by issue.
+
+Options:
+  --type <prefix>   Branch prefix: ${BRANCH_PREFIXES.join(', ')} (default: ${DEFAULT_PREFIX})
+  --base <branch>   Base branch for the new branch (default: ${DEFAULT_BASE})
+  --no-editor       Skip opening the editor after 'add'
+  --force           'remove' only: drop the worktree even if it has changes and
+                    delete the branch even if it is not merged
+  -h, --help        Show this help
+
+Worktrees are created in <repo-name>-worktrees next to the repository, so
+issue 123 lands in ../tinymce-premium-worktrees/feature-${TICKET_PREFIX}123.
+Set MRTREE_WORKTREES_DIR to use a different directory.
+
+The editor is taken from WORKTREE_EDITOR, then EDITOR, falling back to 'code'.
+Arguments are supported, e.g. WORKTREE_EDITOR='code --new-window'.
+
+Only runs in the main checkout's root directory, not in a worktree.
+`;
+
+const step = (message) => console.log(`\n▸ ${message}`);
+const info = (message) => console.log(`  ${message}`);
+const warn = (message) => console.warn(`  ! ${message}`);
+
+const die = (message) => {
+  console.error(`mrtree: ${message}`);
+  process.exit(1);
+};
+
+const capture = (command, args, cwd) => {
+  const result = spawnSync(command, args, { cwd, encoding: 'utf8' });
+  if (result.error) {
+    return { code: 127, stdout: '', stderr: result.error.message };
+  }
+  return {
+    code: result.status ?? 1,
+    stdout: (result.stdout ?? '').trim(),
+    stderr: (result.stderr ?? '').trim()
+  };
+};
+
+const forward = (command, args, cwd) => {
+  const result = spawnSync(command, args, { cwd, stdio: 'inherit' });
+  if (result.error) {
+    warn(`could not run '${command}': ${result.error.message}`);
+    return 127;
+  }
+  return result.status ?? 1;
+};
+
+const realPath = (path) => {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+};
+
+const findRepoRoot = () => {
+  const revParse = capture('git', [ 'rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir', '--show-toplevel' ], process.cwd());
+  if (revParse.code !== 0) {
+    die('not inside a git repository. Run mrtree from the tinymce-premium root.');
+  }
+  const [ gitDir, gitCommonDir, topLevel ] = revParse.stdout.split('\n');
+  if (topLevel === undefined || topLevel === '') {
+    die('this git repository has no working tree. Run mrtree from the tinymce-premium root.');
+  }
+  if (realPath(gitDir) !== realPath(gitCommonDir)) {
+    die(`this is a worktree (${realPath(topLevel)}). Run mrtree from the main checkout instead.`);
+  }
+  const root = realPath(topLevel);
+  if (realPath(process.cwd()) !== root) {
+    die(`run mrtree from the repository root (${root}).`);
+  }
+  return root;
+};
+
+const repoRoot = findRepoRoot();
+
+const git = (...args) => {
+  const result = capture('git', args, repoRoot);
+  if (result.code !== 0) {
+    die(`\`git ${args.join(' ')}\` failed:\n${result.stderr}`);
+  }
+  return result.stdout;
+};
+
+const tryGit = (...args) => capture('git', args, repoRoot);
+
+const refExists = (ref) => tryGit('rev-parse', '--verify', '--quiet', ref).code === 0;
+
+const worktreesDir = process.env.MRTREE_WORKTREES_DIR
+  ? resolve(process.env.MRTREE_WORKTREES_DIR)
+  : join(dirname(repoRoot), `${basename(repoRoot)}-worktrees`);
+
+const parseIssue = (raw, command) => {
+  if (raw === undefined) {
+    die(`\`${command}\` needs an issue number, e.g. \`./mrtree ${command} 123\`.`);
+  }
+  const match = /^(?:TINYMCE-)?(\d+)$/i.exec(raw.trim());
+  if (match === null) {
+    die(`'${raw}' is not an issue number. Expected 123 or ${TICKET_PREFIX}123.`);
+  }
+  return match[1];
+};
+
+const toBranch = (prefix, issue) => `${prefix}/${TICKET_PREFIX}${issue}`;
+const toWorktreePath = (prefix, issue) => join(worktreesDir, `${prefix}-${TICKET_PREFIX}${issue}`);
+
+const listWorktrees = () => {
+  const worktrees = [];
+  for (const line of git('worktree', 'list', '--porcelain').split('\n')) {
+    if (line.startsWith('worktree ')) {
+      worktrees.push({
+        path: line.slice('worktree '.length),
+        branch: null,
+        head: null,
+        detached: false,
+        locked: false,
+        prunable: false,
+        isMain: worktrees.length === 0
+      });
+      continue;
+    }
+    const worktree = worktrees.at(-1);
+    if (worktree === undefined) {
+      continue;
+    } else if (line.startsWith('branch ')) {
+      worktree.branch = line.slice('branch '.length).replace(/^refs\/heads\//, '');
+    } else if (line.startsWith('HEAD ')) {
+      worktree.head = line.slice('HEAD '.length);
+    } else if (line === 'detached') {
+      worktree.detached = true;
+    } else if (line.startsWith('locked')) {
+      worktree.locked = true;
+    } else if (line.startsWith('prunable')) {
+      worktree.prunable = true;
+    }
+  }
+  return worktrees;
+};
+
+const copyLocalConfig = (worktreePath) => {
+  const copied = [];
+  for (const relative of LOCAL_CONFIG) {
+    const source = join(repoRoot, relative);
+    if (!existsSync(source)) {
+      continue;
+    }
+    const target = join(worktreePath, relative);
+    mkdirSync(dirname(target), { recursive: true });
+    cpSync(source, target, { recursive: true });
+    copied.push(relative);
+  }
+  return copied;
+};
+
+const openEditor = (worktreePath) => {
+  const command = process.env.WORKTREE_EDITOR || process.env.EDITOR || 'code';
+  const [ editor, ...editorArgs ] = command.trim().split(/\s+/);
+  step(`Opening ${command}`);
+  return forward(editor, [ ...editorArgs, worktreePath ], worktreePath) === 0;
+};
+
+const updateBase = (base) => {
+  step('Fetching the latest changes from origin');
+  const fetch = tryGit('fetch', 'origin', '--prune');
+  if (fetch.code !== 0) {
+    warn(`\`git fetch\` failed, falling back to the refs already in the repository:\n${fetch.stderr}`);
+  }
+
+  const remoteBase = `origin/${base}`;
+  const hasRemoteBase = refExists(remoteBase);
+  if (!hasRemoteBase && !refExists(`refs/heads/${base}`)) {
+    die(`base branch '${base}' does not exist locally or on origin.`);
+  }
+
+  // Keep the main checkout current too, so it doesn't drift behind the worktrees.
+  if (hasRemoteBase && git('rev-parse', '--abbrev-ref', 'HEAD') === base) {
+    const merge = tryGit('merge', '--ff-only', remoteBase);
+    if (merge.code === 0) {
+      info(`${repoRoot} fast-forwarded to ${remoteBase}`);
+    } else {
+      warn(`could not fast-forward '${base}' in ${repoRoot}, leaving it alone.`);
+    }
+  }
+
+  return hasRemoteBase ? remoteBase : base;
+};
+
+const planWorktreeAdd = (branch, worktreePath, startPoint) => {
+  if (refExists(`refs/heads/${branch}`)) {
+    return {
+      args: [ 'worktree', 'add', worktreePath, branch ],
+      note: `reused the existing branch '${branch}', so ${startPoint} was not used as the base`
+    };
+  }
+  // `git fetch` only writes refs/remotes/*, so a branch pushed from another machine or by
+  // somebody else exists as origin/<branch> and never shows up under refs/heads.
+  if (refExists(`refs/remotes/origin/${branch}`)) {
+    return {
+      args: [ 'worktree', 'add', '--track', '-b', branch, worktreePath, `origin/${branch}` ],
+      note: `checked out origin/${branch} and set it as the upstream, so ${startPoint} was not used as the base`
+    };
+  }
+  return {
+    args: [ 'worktree', 'add', '--no-track', '-b', branch, worktreePath, startPoint ],
+    note: `created '${branch}' from ${startPoint}`
+  };
+};
+
+const add = (issue, options) => {
+  const branch = toBranch(options.type, issue);
+  const worktreePath = toWorktreePath(options.type, issue);
+
+  // There is nothing to create, so point the editor at what is already there before bailing out.
+  const dieOnExisting = (message, existingPath) => {
+    console.error(`mrtree: ${message}`);
+    if (options.editor && !openEditor(existingPath)) {
+      warn('the editor could not be opened. Set WORKTREE_EDITOR to the command you use');
+    }
+    process.exit(1);
+  };
+
+  if (existsSync(worktreePath)) {
+    dieOnExisting(`${worktreePath} already exists. Remove it with \`./mrtree remove ${issue} --type ${options.type}\`.`, worktreePath);
+  }
+  const checkedOut = listWorktrees().find((worktree) => worktree.branch === branch);
+  if (checkedOut !== undefined) {
+    dieOnExisting(`'${branch}' is already checked out in ${checkedOut.path}.`, checkedOut.path);
+  }
+
+  const startPoint = updateBase(options.base);
+
+  step(`Creating the worktree for '${branch}'`);
+  mkdirSync(worktreesDir, { recursive: true });
+  const plan = planWorktreeAdd(branch, worktreePath, startPoint);
+  const worktreeAdd = tryGit(...plan.args);
+  if (worktreeAdd.code !== 0) {
+    die(`\`git worktree add\` failed:\n${worktreeAdd.stderr}`);
+  }
+  info(plan.note);
+  info(worktreePath);
+
+  const problems = [];
+
+  step('Copying the local config files');
+  const copied = copyLocalConfig(worktreePath);
+  if (copied.length === 0) {
+    warn(`nothing to copy: none of ${LOCAL_CONFIG.join(', ')} exist in ${repoRoot}`);
+  } else {
+    copied.forEach(info);
+  }
+
+  step('Installing the dependencies with `bun install`');
+  if (forward('bun', [ 'install' ], worktreePath) !== 0) {
+    problems.push('`bun install` failed, so the worktree has no dependencies yet');
+  }
+
+  step('Running the initial build with `make`');
+  if (forward('make', [], worktreePath) !== 0) {
+    problems.push('`make` failed. Check the AWS credentials (`assume`) and the S3 settings in .env');
+  }
+
+  if (options.editor) {
+    if (!openEditor(worktreePath)) {
+      problems.push('the editor could not be opened. Set WORKTREE_EDITOR to the command you use');
+    }
+  }
+
+  step(`Worktree for '${branch}' is ready`);
+  info(worktreePath);
+  if (problems.length > 0) {
+    console.log();
+    problems.forEach(warn);
+    warn('the worktree itself is fine, so fix the above and re-run the failed step in it');
+    process.exitCode = 1;
+  }
+};
+
+const remove = (issue, options) => {
+  const branch = toBranch(options.type, issue);
+  const worktreePath = toWorktreePath(options.type, issue);
+  const worktrees = listWorktrees();
+
+  const managed = worktrees.find((worktree) => !worktree.isMain && realPath(worktree.path) === realPath(worktreePath));
+  if (managed === undefined) {
+    const elsewhere = worktrees.find((worktree) => !worktree.isMain && worktree.branch === branch);
+    if (elsewhere !== undefined) {
+      die(`'${branch}' is checked out in ${elsewhere.path}, which mrtree does not manage. Remove it with \`git worktree remove ${elsewhere.path}\`.`);
+    }
+    // A previous run may have removed the worktree but kept an unmerged branch behind.
+    if (refExists(`refs/heads/${branch}`)) {
+      if (!options.force) {
+        die(`there is no worktree for '${branch}', but the branch still exists. Re-run with --force to delete just the branch.`);
+      }
+      step(`Deleting the leftover branch '${branch}'`);
+      const leftover = tryGit('branch', '-D', branch);
+      if (leftover.code !== 0) {
+        die(`\`git branch -D ${branch}\` failed:\n${leftover.stderr}`);
+      }
+      info(`deleted the branch '${branch}'`);
+      return;
+    }
+    die(`no worktree for '${branch}'. Run \`./mrtree list\` to see what exists.`);
+  }
+
+  step(`Removing the worktree for '${branch}'`);
+  const removeArgs = [ 'worktree', 'remove', ...(options.force ? [ '--force' ] : []), managed.path ];
+  const worktreeRemove = tryGit(...removeArgs);
+  if (worktreeRemove.code !== 0) {
+    die(`\`git worktree remove\` failed:\n${worktreeRemove.stderr}\n\nTo throw away uncommitted work in the worktree, re-run with --force.`);
+  }
+  tryGit('worktree', 'prune');
+  info(`removed ${managed.path}`);
+
+  if (!refExists(`refs/heads/${branch}`)) {
+    return;
+  }
+  // `-d` refuses to drop unmerged work, which is exactly the safety net we want unless --force.
+  const branchDelete = tryGit('branch', options.force ? '-D' : '-d', branch);
+  if (branchDelete.code === 0) {
+    info(`deleted the branch '${branch}'`);
+  } else {
+    warn(`the worktree is gone, but the branch could not be deleted:\n${branchDelete.stderr}`);
+    warn(`to delete it anyway, run \`git branch -D ${branch}\``);
+    process.exitCode = 1;
+  }
+};
+
+const list = (issue) => {
+  const suffix = issue === undefined ? null : `/${TICKET_PREFIX}${issue}`;
+  const worktrees = listWorktrees().filter((worktree) =>
+    suffix === null || (worktree.branch !== null && worktree.branch.endsWith(suffix)));
+
+  if (worktrees.length === 0) {
+    console.log(issue === undefined ? 'No worktrees.' : `No worktrees for ${TICKET_PREFIX}${issue}.`);
+    return;
+  }
+
+  const rows = worktrees.map((worktree) => {
+    const notes = [
+      worktree.isMain ? 'main checkout' : null,
+      worktree.locked ? 'locked' : null,
+      worktree.prunable ? 'prunable' : null,
+      !worktree.isMain && realPath(dirname(worktree.path)) !== realPath(worktreesDir) ? 'outside the worktrees directory' : null
+    ].filter((note) => note !== null);
+    return {
+      branch: worktree.branch ?? `(detached at ${(worktree.head ?? '').slice(0, 9)})`,
+      path: worktree.path,
+      notes: notes.length === 0 ? '' : `(${notes.join(', ')})`
+    };
+  });
+
+  const branchWidth = Math.max(...rows.map((row) => row.branch.length));
+  const pathWidth = Math.max(...rows.map((row) => row.path.length));
+  for (const row of rows) {
+    console.log(`${row.branch.padEnd(branchWidth)}  ${row.path.padEnd(row.notes === '' ? 0 : pathWidth)}  ${row.notes}`.trimEnd());
+  }
+};
+
+const parse = () => {
+  try {
+    return parseArgs({
+      allowPositionals: true,
+      options: {
+        type: { type: 'string', default: DEFAULT_PREFIX },
+        base: { type: 'string', default: DEFAULT_BASE },
+        'no-editor': { type: 'boolean', default: false },
+        force: { type: 'boolean', default: false },
+        help: { type: 'boolean', short: 'h', default: false }
+      }
+    });
+  } catch (e) {
+    die(`${e.message}\n\nRun \`./mrtree --help\` for the supported commands and flags.`);
+  }
+};
+
+const { values, positionals } = parse();
+const [ command, issueArg, ...extra ] = positionals;
+
+if (values.help || command === undefined) {
+  console.log(HELP);
+  process.exit(values.help ? 0 : 1);
+}
+if (extra.length > 0) {
+  die(`unexpected argument '${extra[0]}'. Run \`./mrtree --help\`.`);
+}
+if (!BRANCH_PREFIXES.includes(values.type)) {
+  die(`'${values.type}' is not an allowed branch prefix. Use one of: ${BRANCH_PREFIXES.join(', ')}.`);
+}
+
+const options = {
+  type: values.type,
+  base: values.base,
+  force: values.force,
+  editor: !values[ 'no-editor' ]
+};
+
+switch (command) {
+  case 'add':
+    add(parseIssue(issueArg, 'add'), options);
+    break;
+  case 'remove':
+    remove(parseIssue(issueArg, 'remove'), options);
+    break;
+  case 'list':
+    list(issueArg === undefined ? undefined : parseIssue(issueArg, 'list'));
+    break;
+  default:
+    die(`unknown command '${command}'. Expected add, remove or list.`);
+}
